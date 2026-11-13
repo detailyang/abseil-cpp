@@ -15,9 +15,11 @@
 #include "absl/random/poisson_distribution.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -105,7 +107,6 @@ TYPED_TEST(PoissonDistributionInterfaceTest, SerializeTest) {
       std::nextafter(std::numeric_limits<double>::min(),
                      0.0),  // denorm_max
   };
-
 
   constexpr int kCount = 1000;
   absl::InsecureBitGen gen;

@@ -15,10 +15,14 @@
 #include "absl/random/zipf_distribution.h"
 
 #include <algorithm>
+#include <cassert>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -176,15 +180,15 @@ class ZipfModel {
       const double x = v_ + i;
 
       // H(n, q-1)
-      const double hnqm1 =
-          (q_ == 2.0) ? (1.0 / x)
-                      : (q_ == 3.0) ? (1.0 / (x * x)) : std::pow(x, -qm1);
+      const double hnqm1 = (q_ == 2.0)   ? (1.0 / x)
+                           : (q_ == 3.0) ? (1.0 / (x * x))
+                                         : std::pow(x, -qm1);
       sum_hnq_m1 += hnqm1;
 
       // H(n, q)
-      const double hnq =
-          (q_ == 2.0) ? (1.0 / (x * x))
-                      : (q_ == 3.0) ? (1.0 / (x * x * x)) : std::pow(x, -q_);
+      const double hnq = (q_ == 2.0)   ? (1.0 / (x * x))
+                         : (q_ == 3.0) ? (1.0 / (x * x * x))
+                                       : std::pow(x, -q_);
       sum_hnq_ += hnq;
       hnq_.push_back(hnq);
       if (i > 1000 && hnq <= 1e-10) {

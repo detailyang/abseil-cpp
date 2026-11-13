@@ -26,6 +26,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 
 #include "absl/base/config.h"
@@ -75,7 +76,7 @@ class SampleRecorder {
 
   // Iterates over all the registered `StackInfo`s.  Returning the number of
   // samples that have been dropped.
-  int64_t Iterate(const std::function<void(const T& stack)>& f);
+  size_t Iterate(const std::function<void(const T& stack)>& f);
 
   size_t GetMaxSamples() const;
   void SetMaxSamples(size_t max);
@@ -130,7 +131,7 @@ SampleRecorder<T>::SetDisposeCallback(DisposeCallback f) {
 template <typename T>
 SampleRecorder<T>::SampleRecorder()
     : dropped_samples_(0), size_estimate_(0), all_(nullptr), dispose_(nullptr) {
-  absl::MutexLock l(&graveyard_.init_mu);
+  absl::MutexLock l(graveyard_.init_mu);
   graveyard_.dead = &graveyard_;
 }
 
@@ -159,8 +160,8 @@ void SampleRecorder<T>::PushDead(T* sample) {
     dispose(*sample);
   }
 
-  absl::MutexLock graveyard_lock(&graveyard_.init_mu);
-  absl::MutexLock sample_lock(&sample->init_mu);
+  absl::MutexLock graveyard_lock(graveyard_.init_mu);
+  absl::MutexLock sample_lock(sample->init_mu);
   sample->dead = graveyard_.dead;
   graveyard_.dead = sample;
 }
@@ -168,18 +169,26 @@ void SampleRecorder<T>::PushDead(T* sample) {
 template <typename T>
 template <typename... Targs>
 T* SampleRecorder<T>::PopDead(Targs... args) {
-  absl::MutexLock graveyard_lock(&graveyard_.init_mu);
+  T* sample;
+  {
+    absl::MutexLock graveyard_lock(graveyard_.init_mu);
 
-  // The list is circular, so eventually it collapses down to
-  //   graveyard_.dead == &graveyard_
-  // when it is empty.
-  T* sample = graveyard_.dead;
-  if (sample == &graveyard_) return nullptr;
+    // The list is circular, so eventually it collapses down to
+    //   graveyard_.dead == &graveyard_
+    // when it is empty.
+    sample = graveyard_.dead;
+    if (sample == &graveyard_) return nullptr;
 
-  absl::MutexLock sample_lock(&sample->init_mu);
-  graveyard_.dead = sample->dead;
-  sample->dead = nullptr;
+    graveyard_.dead = ABSL_TS_UNCHECKED_READ(sample->dead);
+    // Release the global graveyard lock early, before the potentially slow
+    // preparation.
+  }
+  // `sample` is detached from the graveyard and will not be used in PopDead.
+  // SampleRecorder<T>::Iterate will only read `dead` that is still non-null.
   sample->PrepareForSampling(std::forward<Targs>(args)...);
+  // SampleRecorder<T>::Iterate acquires the same lock before access to `dead`.
+  absl::MutexLock sample_lock(sample->init_mu);
+  sample->dead = nullptr;
   return sample;
 }
 
@@ -198,7 +207,7 @@ T* SampleRecorder<T>::Register(Targs&&... args) {
     // Resurrection failed.  Hire a new warlock.
     sample = new T();
     {
-      absl::MutexLock sample_lock(&sample->init_mu);
+      absl::MutexLock sample_lock(sample->init_mu);
       // If flag initialization happens to occur (perhaps in another thread)
       // while in this block, it will lock `graveyard_` which is usually always
       // locked before any sample. This will appear as a lock inversion.
@@ -222,11 +231,11 @@ void SampleRecorder<T>::Unregister(T* sample) {
 }
 
 template <typename T>
-int64_t SampleRecorder<T>::Iterate(
+size_t SampleRecorder<T>::Iterate(
     const std::function<void(const T& stack)>& f) {
   T* s = all_.load(std::memory_order_acquire);
   while (s != nullptr) {
-    absl::MutexLock l(&s->init_mu);
+    absl::MutexLock l(s->init_mu);
     if (s->dead == nullptr) {
       f(*s);
     }

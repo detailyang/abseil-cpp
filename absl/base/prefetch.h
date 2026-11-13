@@ -31,10 +31,11 @@
 #include <xmmintrin.h>
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER >= 1900 && \
-    (defined(_M_X64) || defined(_M_IX86))
+#if defined(_MSC_VER)
 #include <intrin.h>
+#if defined(ABSL_INTERNAL_HAVE_SSE)
 #pragma intrinsic(_mm_prefetch)
+#endif
 #endif
 
 namespace absl {
@@ -116,7 +117,9 @@ void PrefetchToLocalCacheNta(const void* addr);
 // This function is similar to `PrefetchToLocalCache()` except that it
 // prefetches cachelines with an 'intent to modify' This typically includes
 // invalidating cache entries for this address in all other cache tiers, and an
-// exclusive access intent.
+// exclusive access intent. On targets where the compiler cannot assume a
+// write-prefetch instruction (e.g. x86-64 without PRFCHW), this is equivalent
+// to `PrefetchToLocalCache()`.
 //
 // Incorrect or gratuitous use of this function can degrade performance. As this
 // function can invalidate cached cachelines on other caches and computer cores,
@@ -128,7 +131,7 @@ void PrefetchToLocalCacheNta(const void* addr);
 //
 //  void* Arena::Allocate(size_t size) {
 //    void* ptr = AllocateBlock(size);
-//    absl::PrefetchToLocalCacheForWrite(p);
+//    absl::PrefetchToLocalCacheForWrite(ptr);
 //    return ptr;
 //  }
 //
@@ -153,15 +156,7 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE inline void PrefetchToLocalCacheNta(
 
 ABSL_ATTRIBUTE_ALWAYS_INLINE inline void PrefetchToLocalCacheForWrite(
     const void* addr) {
-  // [x86] gcc/clang don't generate PREFETCHW for __builtin_prefetch(.., 1)
-  // unless -march=broadwell or newer; this is not generally the default, so we
-  // manually emit prefetchw. PREFETCHW is recognized as a no-op on older Intel
-  // processors and has been present on AMD processors since the K6-2.
-#if defined(__x86_64__)
-  asm("prefetchw (%0)" : : "r"(addr));
-#else
   __builtin_prefetch(addr, 1, 3);
-#endif
 }
 
 #elif defined(ABSL_INTERNAL_HAVE_SSE)
@@ -182,12 +177,8 @@ ABSL_ATTRIBUTE_ALWAYS_INLINE inline void PrefetchToLocalCacheForWrite(
     const void* addr) {
 #if defined(_MM_HINT_ET0)
   _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_ET0);
-#elif !defined(_MSC_VER) && defined(__x86_64__)
-  // _MM_HINT_ET0 is not universally supported. As we commented further
-  // up, PREFETCHW is recognized as a no-op on older Intel processors
-  // and has been present on AMD processors since the K6-2. We have this
-  // disabled for MSVC compilers as this miscompiles on older MSVC compilers.
-  asm("prefetchw (%0)" : : "r"(addr));
+#else
+  _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0);
 #endif
 }
 

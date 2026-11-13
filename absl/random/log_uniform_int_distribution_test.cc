@@ -14,9 +14,12 @@
 
 #include "absl/random/log_uniform_int_distribution.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <random>
 #include <sstream>
 #include <string>
@@ -24,6 +27,7 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/base/macros.h"
 #include "absl/log/log.h"
 #include "absl/random/internal/chi_square.h"
 #include "absl/random/internal/distribution_test_util.h"
@@ -112,6 +116,26 @@ TYPED_TEST(LogUniformIntDistributionTypeTest, SerializeTest) {
   }
 }
 
+// operator>> must reject input that violates the param_type preconditions
+// (max >= min and base > 1) by setting failbit and leaving the distribution
+// unchanged, rather than constructing an out-of-contract param_type.
+TYPED_TEST(LogUniformIntDistributionTypeTest, DeserializeRejectsInvalidParams) {
+  for (const char* input : {
+           "0 100 1",  // base == 1
+           "0 100 0",  // base == 0
+           "100 0 2",  // max < min
+       }) {
+    absl::log_uniform_int_distribution<TypeParam> dist(3, 6, 17);
+    const auto before = dist.param();
+
+    std::istringstream is(input);
+    is >> dist;
+
+    EXPECT_TRUE(is.fail()) << input;
+    EXPECT_EQ(dist.param(), before) << input;
+  }
+}
+
 using log_uniform_i32 = absl::log_uniform_int_distribution<int32_t>;
 
 class LogUniformIntChiSquaredTest
@@ -148,8 +172,8 @@ double LogUniformIntChiSquaredTest::ChiSquaredTestImpl() {
   const auto bucket_index = [base_log, is_2, &param](int32_t x) {
     uint64_t y = static_cast<uint64_t>(x) - param.min();
     return (y == 0) ? 0
-                    : is_2 ? static_cast<int>(1 + std::log2(y))
-                           : static_cast<int>(1 + std::log(y) * base_log);
+           : is_2   ? static_cast<int>(1 + std::log2(y))
+                    : static_cast<int>(1 + std::log(y) * base_log);
   };
   const int max_bucket = bucket_index(param.max());  // inclusive
   const size_t trials = 15 + (max_bucket + 1) * 10;

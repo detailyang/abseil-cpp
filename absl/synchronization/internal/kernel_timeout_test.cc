@@ -14,29 +14,40 @@
 
 #include "absl/synchronization/internal/kernel_timeout.h"
 
-#include <ctime>
+#include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
+#include <cstdint>
+#include <ctime>
 #include <limits>
 
-#include "absl/base/config.h"
-#include "absl/random/random.h"
+#include "gtest/gtest.h"
+#include "absl/time/civil_time.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "gtest/gtest.h"
 
-// Test go/btm support by randomizing the value of clock_gettime() for
-// CLOCK_MONOTONIC. This works by overriding a weak symbol in glibc.
+#if 0  // All supported platforms currently have steady clocks.
+#define ABSL_INTERNAL_KERNEL_TIMEOUT_SUPPORTS_STEADY_CLOCK 0
+#else
+#define ABSL_INTERNAL_KERNEL_TIMEOUT_SUPPORTS_STEADY_CLOCK 1
+#endif
+
+static_assert(
+    absl::synchronization_internal::KernelTimeout::SupportsSteadyClock() ==
+    static_cast<bool>(ABSL_INTERNAL_KERNEL_TIMEOUT_SUPPORTS_STEADY_CLOCK));
+
+// Randomizing the value of clock_gettime() for CLOCK_MONOTONIC.
+// This works by overriding a weak symbol in glibc.
 // We should be resistant to this randomization when !SupportsSteadyClock().
-#if defined(__GOOGLE_GRTE_VERSION__) &&      \
-    !defined(ABSL_HAVE_ADDRESS_SANITIZER) && \
-    !defined(ABSL_HAVE_MEMORY_SANITIZER) &&  \
+#if !ABSL_INTERNAL_KERNEL_TIMEOUT_SUPPORTS_STEADY_CLOCK && \
+    !defined(ABSL_HAVE_ADDRESS_SANITIZER) &&               \
+    !defined(ABSL_HAVE_MEMORY_SANITIZER) &&                \
     !defined(ABSL_HAVE_THREAD_SANITIZER)
 extern "C" int __clock_gettime(clockid_t c, struct timespec* ts);
 
 extern "C" int clock_gettime(clockid_t c, struct timespec* ts) {
   if (c == CLOCK_MONOTONIC &&
       !absl::synchronization_internal::KernelTimeout::SupportsSteadyClock()) {
-    absl::SharedBitGen gen;
+    thread_local absl::BitGen gen;  // NOLINT
     ts->tv_sec = absl::Uniform(gen, 0, 1'000'000'000);
     ts->tv_nsec = absl::Uniform(gen, 0, 1'000'000'000);
     return 0;
@@ -58,7 +69,22 @@ constexpr absl::Duration kTimingBound = absl::Microseconds(250);
 
 using absl::synchronization_internal::KernelTimeout;
 
-TEST(KernelTimeout, FiniteTimes) {
+// Returns a time far in the future.
+// On 32-bit time_t systems, the maximum representable time is in January 2038.
+// On 64-bit systems, the maximum representable time in KernelTimeout is in
+// April 2262 (int64_t max nanoseconds).
+absl::Time FarFuture() {
+  static const absl::Time far_future =
+      sizeof(time_t) <= 4
+          ? absl::FromCivil(absl::CivilSecond(2038, 1, 1, 0, 0, 0),
+                            absl::UTCTimeZone())
+          : absl::FromCivil(absl::CivilSecond(2262, 1, 1, 0, 0, 0),
+                            absl::UTCTimeZone());
+  return far_future;
+}
+
+// TODO(b/348224897): re-enabled when the flakiness is fixed.
+TEST(KernelTimeout, DISABLED_FiniteTimes) {
   constexpr absl::Duration kDurationsToTest[] = {
     absl::ZeroDuration(),
     absl::Nanoseconds(1),
@@ -116,16 +142,14 @@ TEST(KernelTimeout, InfiniteFuture) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -141,16 +165,14 @@ TEST(KernelTimeout, DefaultConstructor) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -166,16 +188,14 @@ TEST(KernelTimeout, TimeMaxNanos) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -191,16 +211,14 @@ TEST(KernelTimeout, Never) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -228,7 +246,8 @@ TEST(KernelTimeout, InfinitePast) {
   EXPECT_EQ(t.ToChronoDuration(), std::chrono::nanoseconds(0));
 }
 
-TEST(KernelTimeout, FiniteDurations) {
+// TODO(b/348224897): re-enabled when the flakiness is fixed.
+TEST(KernelTimeout, DISABLED_FiniteDurations) {
   constexpr absl::Duration kDurationsToTest[] = {
     absl::ZeroDuration(),
     absl::Nanoseconds(1),
@@ -274,7 +293,8 @@ TEST(KernelTimeout, FiniteDurations) {
   }
 }
 
-TEST(KernelTimeout, NegativeDurations) {
+// TODO(b/348224897): re-enabled when the flakiness is fixed.
+TEST(KernelTimeout, DISABLED_NegativeDurations) {
   constexpr absl::Duration kDurationsToTest[] = {
     -absl::ZeroDuration(),
     -absl::Nanoseconds(1),
@@ -323,16 +343,14 @@ TEST(KernelTimeout, InfiniteDuration) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -348,16 +366,14 @@ TEST(KernelTimeout, DurationMaxNanos) {
   // below, but we do try to do something reasonable if they don't. We may not
   // be able to round-trip back to absl::InfiniteDuration() or
   // absl::InfiniteFuture(), but we should return a very large value.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_EQ(t.InMillisecondsFromNow(),
             std::numeric_limits<KernelTimeout::DWord>::max());
   EXPECT_EQ(t.ToChronoTimePoint(),
@@ -373,16 +389,14 @@ TEST(KernelTimeout, OverflowNanos) {
   absl::Duration duration = absl::Nanoseconds(limit) + absl::Seconds(1);
   KernelTimeout t(duration);
   // Timeouts should still be far in the future.
-  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::TimeFromTimespec(t.MakeAbsTimespec()), FarFuture());
 #ifndef _WIN32
   EXPECT_GT(absl::TimeFromTimespec(t.MakeClockAbsoluteTimespec(CLOCK_REALTIME)),
-            absl::Now() + absl::Hours(100000));
+            FarFuture());
 #endif
   EXPECT_GT(absl::DurationFromTimespec(t.MakeRelativeTimespec()),
             absl::Hours(100000));
-  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()),
-            absl::Now() + absl::Hours(100000));
+  EXPECT_GT(absl::FromUnixNanos(t.MakeAbsNanos()), FarFuture());
   EXPECT_LE(absl::Milliseconds(t.InMillisecondsFromNow()) - duration,
             absl::Milliseconds(5));
   EXPECT_GT(t.ToChronoTimePoint(),

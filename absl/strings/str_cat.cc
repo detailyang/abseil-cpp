@@ -20,15 +20,22 @@
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#include <limits>
 #include <string>
 
 #include "absl/base/config.h"
-#include "absl/strings/internal/resize_uninitialized.h"
+#include "absl/base/internal/raw_logging.h"
+#include "absl/base/macros.h"
+#include "absl/base/nullability.h"
+#include "absl/base/optimization.h"
+#include "absl/base/throw_delegate.h"
+#include "absl/strings/internal/append_and_overwrite.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/resize_and_overwrite.h"
 #include "absl/strings/string_view.h"
 
 namespace absl {
 ABSL_NAMESPACE_BEGIN
-
 
 // ----------------------------------------------------------------------
 // StrCat()
@@ -40,7 +47,7 @@ ABSL_NAMESPACE_BEGIN
 namespace {
 // Append is merely a version of memcpy that returns the address of the byte
 // after the area just overwritten.
-inline char* Append(char* out, const AlphaNum& x) {
+inline char* absl_nonnull Append(char* absl_nonnull out, const AlphaNum& x) {
   // memcpy is allowed to overwrite arbitrary memory, so doing this after the
   // call would force an extra fetch of x.size().
   char* after = out + x.size();
@@ -50,50 +57,136 @@ inline char* Append(char* out, const AlphaNum& x) {
   return after;
 }
 
-inline void STLStringAppendUninitializedAmortized(std::string* dest,
-                                                  size_t to_append) {
-  strings_internal::AppendUninitializedTraits<std::string>::Append(dest,
-                                                                   to_append);
+// Safely adds size_t values, throwing std::length_error if overflow occurs.
+inline size_t SafeAdd(size_t a, size_t b) {
+  const uint64_t sum = static_cast<uint64_t>(a) + b;
+  if (ABSL_PREDICT_FALSE(sum > (std::numeric_limits<size_t>::max)())) {
+    ThrowStdLengthError("absl string append length overflow");
+  }
+  return static_cast<size_t>(sum);
 }
+
+inline size_t SafeAdd(std::initializer_list<size_t> sizes) {
+  uint64_t sum = 0;
+  for (size_t size : sizes) {
+    sum += size;
+  }
+  if (ABSL_PREDICT_FALSE(sum > (std::numeric_limits<size_t>::max)())) {
+    ThrowStdLengthError("absl string append length overflow");
+  }
+  return static_cast<size_t>(sum);
+}
+
+template <typename Integer>
+std::string IntegerToString(Integer i) {
+  // Any integer (signed/unsigned) up to 64 bits can be formatted into a buffer
+  // with 22 bytes (including NULL at the end).
+  constexpr size_t kMaxDigits10 = 22;
+  std::string result;
+  StringResizeAndOverwrite(
+      result, kMaxDigits10, [i](char* start, size_t buf_size) {
+        // Note: This can be optimized to not write last zero.
+        char* end = numbers_internal::FastIntToBuffer(i, start);
+        auto size = static_cast<size_t>(end - start);
+        ABSL_ASSERT(size < buf_size);
+        return size;
+      });
+  return result;
+}
+
+template <typename Float>
+std::string FloatToString(Float f) {
+  std::string result;
+  StringResizeAndOverwrite(result, numbers_internal::kSixDigitsToBufferSize,
+                           [f](char* start, size_t buf_size) {
+                             size_t size = numbers_internal::SixDigitsToBuffer(
+                                 static_cast<double>(f), start);
+                             ABSL_ASSERT(size < buf_size);
+                             return size;
+                           });
+  return result;
+}
+
 }  // namespace
+
+strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize>
+HighPrecision(float f) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize> result;
+  result.size =
+      strlen(numbers_internal::RoundTripFloatToBuffer(f, &result.data[0]));
+  return result;
+}
+
+strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize>
+HighPrecision(double d) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kFastToBufferSize> result;
+  result.size =
+      strlen(numbers_internal::RoundTripDoubleToBuffer(d, &result.data[0]));
+  return result;
+}
 
 std::string StrCat(const AlphaNum& a, const AlphaNum& b) {
   std::string result;
-  absl::strings_internal::STLStringResizeUninitialized(&result,
-                                                       a.size() + b.size());
-  char* const begin = &result[0];
-  char* out = begin;
-  out = Append(out, a);
-  out = Append(out, b);
-  assert(out == begin + result.size());
+  // Use uint64_t to prevent size_t overflow. We assume it is not possible for
+  // in memory strings to overflow a uint64_t.
+  constexpr uint64_t kMaxSize = uint64_t{std::numeric_limits<size_t>::max()};
+  const uint64_t result_size =
+      static_cast<uint64_t>(a.size()) + static_cast<uint64_t>(b.size());
+  ABSL_INTERNAL_CHECK(result_size <= kMaxSize, "size_t overflow");
+  absl::StringResizeAndOverwrite(result, static_cast<size_t>(result_size),
+                                 [&a, &b](char* const begin, size_t buf_size) {
+                                   char* out = begin;
+                                   out = Append(out, a);
+                                   out = Append(out, b);
+                                   assert(out == begin + buf_size);
+                                   return buf_size;
+                                 });
   return result;
 }
 
 std::string StrCat(const AlphaNum& a, const AlphaNum& b, const AlphaNum& c) {
   std::string result;
-  strings_internal::STLStringResizeUninitialized(
-      &result, a.size() + b.size() + c.size());
-  char* const begin = &result[0];
-  char* out = begin;
-  out = Append(out, a);
-  out = Append(out, b);
-  out = Append(out, c);
-  assert(out == begin + result.size());
+  // Use uint64_t to prevent size_t overflow. We assume it is not possible for
+  // in memory strings to overflow a uint64_t.
+  constexpr uint64_t kMaxSize = uint64_t{std::numeric_limits<size_t>::max()};
+  const uint64_t result_size = static_cast<uint64_t>(a.size()) +
+                               static_cast<uint64_t>(b.size()) +
+                               static_cast<uint64_t>(c.size());
+  ABSL_INTERNAL_CHECK(result_size <= kMaxSize, "size_t overflow");
+  absl::StringResizeAndOverwrite(
+      result, static_cast<size_t>(result_size),
+      [&a, &b, &c](char* const begin, size_t buf_size) {
+        char* out = begin;
+        out = Append(out, a);
+        out = Append(out, b);
+        out = Append(out, c);
+        assert(out == begin + buf_size);
+        return buf_size;
+      });
   return result;
 }
 
 std::string StrCat(const AlphaNum& a, const AlphaNum& b, const AlphaNum& c,
                    const AlphaNum& d) {
   std::string result;
-  strings_internal::STLStringResizeUninitialized(
-      &result, a.size() + b.size() + c.size() + d.size());
-  char* const begin = &result[0];
-  char* out = begin;
-  out = Append(out, a);
-  out = Append(out, b);
-  out = Append(out, c);
-  out = Append(out, d);
-  assert(out == begin + result.size());
+  // Use uint64_t to prevent size_t overflow. We assume it is not possible for
+  // in memory strings to overflow a uint64_t.
+  constexpr uint64_t kMaxSize = uint64_t{std::numeric_limits<size_t>::max()};
+  const uint64_t result_size =
+      static_cast<uint64_t>(a.size()) + static_cast<uint64_t>(b.size()) +
+      static_cast<uint64_t>(c.size()) + static_cast<uint64_t>(d.size());
+  ABSL_INTERNAL_CHECK(result_size <= kMaxSize, "size_t overflow");
+  absl::StringResizeAndOverwrite(
+      result, static_cast<size_t>(result_size),
+      [&a, &b, &c, &d](char* const begin, size_t buf_size) {
+        char* out = begin;
+        out = Append(out, a);
+        out = Append(out, b);
+        out = Append(out, c);
+        out = Append(out, d);
+        assert(out == begin + buf_size);
+        return buf_size;
+      });
   return result;
 }
 
@@ -102,20 +195,27 @@ namespace strings_internal {
 // Do not call directly - these are not part of the public API.
 std::string CatPieces(std::initializer_list<absl::string_view> pieces) {
   std::string result;
-  size_t total_size = 0;
-  for (absl::string_view piece : pieces) total_size += piece.size();
-  strings_internal::STLStringResizeUninitialized(&result, total_size);
-
-  char* const begin = &result[0];
-  char* out = begin;
+  // Use uint64_t to prevent size_t overflow. We assume it is not possible for
+  // in memory strings to overflow a uint64_t.
+  constexpr uint64_t kMaxSize = uint64_t{std::numeric_limits<size_t>::max()};
+  uint64_t total_size = 0;
   for (absl::string_view piece : pieces) {
-    const size_t this_size = piece.size();
-    if (this_size != 0) {
-      memcpy(out, piece.data(), this_size);
-      out += this_size;
-    }
+    total_size += piece.size();
   }
-  assert(out == begin + result.size());
+  ABSL_INTERNAL_CHECK(total_size <= kMaxSize, "size_t overflow");
+  absl::StringResizeAndOverwrite(result, static_cast<size_t>(total_size),
+                                 [&pieces](char* const begin, size_t buf_size) {
+                                   char* out = begin;
+                                   for (absl::string_view piece : pieces) {
+                                     const size_t this_size = piece.size();
+                                     if (this_size != 0) {
+                                       memcpy(out, piece.data(), this_size);
+                                       out += this_size;
+                                     }
+                                   }
+                                   assert(out == begin + buf_size);
+                                   return buf_size;
+                                 });
   return result;
 }
 
@@ -128,83 +228,111 @@ std::string CatPieces(std::initializer_list<absl::string_view> pieces) {
   assert(((src).size() == 0) ||      \
          (uintptr_t((src).data() - (dest).data()) > uintptr_t((dest).size())))
 
-void AppendPieces(std::string* dest,
+void AppendPieces(std::string* absl_nonnull dest,
                   std::initializer_list<absl::string_view> pieces) {
-  size_t old_size = dest->size();
   size_t to_append = 0;
   for (absl::string_view piece : pieces) {
     ASSERT_NO_OVERLAP(*dest, piece);
-    to_append += piece.size();
+    to_append = SafeAdd(to_append, piece.size());
   }
-  STLStringAppendUninitializedAmortized(dest, to_append);
-
-  char* const begin = &(*dest)[0];
-  char* out = begin + old_size;
-  for (absl::string_view piece : pieces) {
-    const size_t this_size = piece.size();
-    if (this_size != 0) {
-      memcpy(out, piece.data(), this_size);
-      out += this_size;
-    }
-  }
-  assert(out == begin + dest->size());
+  StringAppendAndOverwrite(*dest, to_append,
+                           [&pieces](char* const buf, size_t buf_size) {
+                             char* out = buf;
+                             for (absl::string_view piece : pieces) {
+                               const size_t this_size = piece.size();
+                               if (this_size != 0) {
+                                 memcpy(out, piece.data(), this_size);
+                                 out += this_size;
+                               }
+                             }
+                             assert(out == buf + buf_size);
+                             return buf_size;
+                           });
 }
+
+std::string SingleArgStrCat(int x) { return IntegerToString(x); }
+std::string SingleArgStrCat(unsigned int x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+std::string SingleArgStrCat(long x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+std::string SingleArgStrCat(unsigned long x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+std::string SingleArgStrCat(long long x) { return IntegerToString(x); }
+// NOLINTNEXTLINE
+std::string SingleArgStrCat(unsigned long long x) { return IntegerToString(x); }
+std::string SingleArgStrCat(float x) { return FloatToString(x); }
+std::string SingleArgStrCat(double x) { return FloatToString(x); }
 
 }  // namespace strings_internal
 
-void StrAppend(std::string* dest, const AlphaNum& a) {
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a) {
   ASSERT_NO_OVERLAP(*dest, a);
-  std::string::size_type old_size = dest->size();
-  STLStringAppendUninitializedAmortized(dest, a.size());
-  char* const begin = &(*dest)[0];
-  char* out = begin + old_size;
-  out = Append(out, a);
-  assert(out == begin + dest->size());
+  strings_internal::StringAppendAndOverwrite(
+      *dest, a.size(), [&a](char* const buf, size_t buf_size) {
+        char* out = buf;
+        out = Append(out, a);
+        assert(out == buf + buf_size);
+        return buf_size;
+      });
 }
 
-void StrAppend(std::string* dest, const AlphaNum& a, const AlphaNum& b) {
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b) {
   ASSERT_NO_OVERLAP(*dest, a);
   ASSERT_NO_OVERLAP(*dest, b);
-  std::string::size_type old_size = dest->size();
-  STLStringAppendUninitializedAmortized(dest, a.size() + b.size());
-  char* const begin = &(*dest)[0];
-  char* out = begin + old_size;
-  out = Append(out, a);
-  out = Append(out, b);
-  assert(out == begin + dest->size());
+  strings_internal::StringAppendAndOverwrite(
+      *dest, SafeAdd(a.size(), b.size()),
+      [&a, &b](char* const buf, size_t buf_size) {
+        char* out = buf;
+        out = Append(out, a);
+        out = Append(out, b);
+        assert(out == buf + buf_size);
+        return buf_size;
+      });
 }
 
-void StrAppend(std::string* dest, const AlphaNum& a, const AlphaNum& b,
-               const AlphaNum& c) {
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b, const AlphaNum& c) {
   ASSERT_NO_OVERLAP(*dest, a);
   ASSERT_NO_OVERLAP(*dest, b);
   ASSERT_NO_OVERLAP(*dest, c);
-  std::string::size_type old_size = dest->size();
-  STLStringAppendUninitializedAmortized(dest, a.size() + b.size() + c.size());
-  char* const begin = &(*dest)[0];
-  char* out = begin + old_size;
-  out = Append(out, a);
-  out = Append(out, b);
-  out = Append(out, c);
-  assert(out == begin + dest->size());
+  strings_internal::StringAppendAndOverwrite(
+      *dest, SafeAdd({a.size(), b.size(), c.size()}),
+      [&a, &b, &c](char* const buf, size_t buf_size) {
+        char* out = buf;
+        out = Append(out, a);
+        out = Append(out, b);
+        out = Append(out, c);
+        assert(out == buf + buf_size);
+        return buf_size;
+      });
 }
 
-void StrAppend(std::string* dest, const AlphaNum& a, const AlphaNum& b,
-               const AlphaNum& c, const AlphaNum& d) {
+void StrAppend(std::string* absl_nonnull dest, const AlphaNum& a,
+               const AlphaNum& b, const AlphaNum& c, const AlphaNum& d) {
   ASSERT_NO_OVERLAP(*dest, a);
   ASSERT_NO_OVERLAP(*dest, b);
   ASSERT_NO_OVERLAP(*dest, c);
   ASSERT_NO_OVERLAP(*dest, d);
-  std::string::size_type old_size = dest->size();
-  STLStringAppendUninitializedAmortized(
-      dest, a.size() + b.size() + c.size() + d.size());
-  char* const begin = &(*dest)[0];
-  char* out = begin + old_size;
-  out = Append(out, a);
-  out = Append(out, b);
-  out = Append(out, c);
-  out = Append(out, d);
-  assert(out == begin + dest->size());
+  strings_internal::StringAppendAndOverwrite(
+      *dest, SafeAdd({a.size(), b.size(), c.size(), d.size()}),
+      [&a, &b, &c, &d](char* const buf, size_t buf_size) {
+        char* out = buf;
+        out = Append(out, a);
+        out = Append(out, b);
+        out = Append(out, c);
+        out = Append(out, d);
+        assert(out == buf + buf_size);
+        return buf_size;
+      });
+}
+
+strings_internal::AlphaNumBuffer<numbers_internal::kSixDigitsToBufferSize>
+SixDigits(double d) {
+  strings_internal::AlphaNumBuffer<numbers_internal::kSixDigitsToBufferSize>
+      result;
+  result.size = numbers_internal::SixDigitsToBuffer(d, &result.data[0]);
+  return result;
 }
 
 ABSL_NAMESPACE_END

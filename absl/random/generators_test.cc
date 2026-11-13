@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "absl/numeric/int128.h"
 #include "absl/random/distributions.h"
 #include "absl/random/random.h"
 
@@ -116,7 +117,6 @@ void TestBernoulli(URBG* gen) {
   absl::Bernoulli(*gen, 0.5);
   absl::Bernoulli(*gen, 0.5);
 }
-
 
 template <typename URBG>
 void TestZipf(URBG* gen) {
